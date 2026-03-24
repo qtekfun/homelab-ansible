@@ -1,0 +1,33 @@
+# Ansible Vault password files
+.vault_password
+.vault_password_*
+*.vault_pass
+
+# Sensitive variable files (unencrypted)
+*.secret
+*.secrets
+
+# Retry files
+*.retry
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Molecule
+.molecule/
