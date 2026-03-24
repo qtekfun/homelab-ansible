@@ -81,12 +81,41 @@ virsh net-list --all
 # Expected: default listed as active
 ```
 
-> **Note:** scripts and tools that spawn their own shell (e.g. Claude Code's Bash tool)
-> won't inherit this variable. Pass `--connect qemu:///system` explicitly in those contexts.
+> **Note:** scripts and tools that spawn their own shell won't inherit this variable.
+> Pass `--connect qemu:///system` explicitly in those contexts.
 
 ---
 
-## Step 4 — Download the Ubuntu 24.04 LTS cloud image
+## Step 4 — Fix firewalld: assign virbr0 to the libvirt zone
+
+libvirt should assign `virbr0` to the `libvirt` firewalld zone automatically, but on
+Fedora this sometimes doesn't happen until the network is restarted. Without this,
+DHCP is blocked and VMs will never get an IP address.
+
+Check active zones:
+
+```bash
+sudo firewall-cmd --get-active-zones
+```
+
+If `virbr0` is missing from the output, restart the libvirt network to trigger the assignment:
+
+```bash
+sudo virsh net-destroy default && sudo virsh net-start default
+```
+
+Verify `virbr0` now appears under the `libvirt` zone:
+
+```bash
+sudo firewall-cmd --get-active-zones
+# Expected:
+# libvirt
+#   interfaces: virbr0
+```
+
+---
+
+## Step 5 — Download the Ubuntu 24.04 LTS cloud image
 
 Using the cloud image avoids a full ISO install — it boots directly and accepts cloud-init for first-boot configuration.
 
@@ -106,11 +135,17 @@ ls -lh ~/libvirt/images/noble-server-cloudimg-amd64.img
 
 ---
 
-## Step 5 — Create the cloud-init seed ISO
+## Step 6 — Create the cloud-init seed ISO
 
-The cloud image requires a seed ISO on first boot to configure the user and SSH keys.
+The cloud image requires a seed ISO on first boot to configure users and SSH keys.
 
-Create `meta-data`:
+### Generate a hashed password for console access
+
+```bash
+openssl passwd -6 "your-password"
+```
+
+### Create meta-data
 
 ```bash
 cat > ~/libvirt/cloud-init/meta-data <<EOF
@@ -119,7 +154,10 @@ local-hostname: ansible-test-01
 EOF
 ```
 
-Create `user-data` (uses your homelab SSH key):
+### Create user-data
+
+Replace `YOUR_SSH_PUBLIC_KEY` with the output of `cat ~/.ssh/id_ed25519_homelab.pub`
+and `YOUR_HASHED_PASSWORD` with the output of the `openssl passwd` command above.
 
 ```bash
 cat > ~/libvirt/cloud-init/user-data <<EOF
@@ -130,33 +168,45 @@ users:
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
     ssh_authorized_keys:
-      - $(cat ~/.ssh/id_ed25519_homelab.pub)
+      - YOUR_SSH_PUBLIC_KEY
+  - name: ubuntu
+    groups: sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    hashed_passwd: "YOUR_HASHED_PASSWORD"
 
-ssh_pwauth: false
+ssh_pwauth: true
 chpasswd:
   expire: false
 
-package_update: true
+package_update: false
 packages:
   - qemu-guest-agent
 EOF
 ```
 
-Generate the ISO:
+> The `ubuntu` user with a console password is useful for debugging via `virsh console`
+> when SSH is not yet reachable. `ssh_pwauth: true` enables password login on the console
+> only — harden this after initial setup if needed.
+
+### Generate the seed ISO
 
 ```bash
-genisoimage \
+sudo genisoimage \
   -output ~/libvirt/images/ansible-test-01-seed.iso \
   -volid cidata -joliet -rock \
   ~/libvirt/cloud-init/user-data \
   ~/libvirt/cloud-init/meta-data
 ```
 
+> `sudo` is required here because libvirt may have taken ownership of the images directory.
+
 ---
 
-## Step 6 — Prepare the VM disk
+## Step 7 — Prepare the VM disk
 
-Copy the cloud image (keep the original as a base for future VMs) and resize it:
+Copy the cloud image (keep the original as a clean base for future VMs) and resize it:
 
 ```bash
 cp ~/libvirt/images/noble-server-cloudimg-amd64.img \
@@ -167,7 +217,7 @@ qemu-img resize ~/libvirt/images/ansible-test-01.img 20G
 
 ---
 
-## Step 7 — Create the VM with virt-install
+## Step 8 — Create the VM with virt-install
 
 ```bash
 virt-install \
@@ -189,7 +239,7 @@ virt-install \
 
 ---
 
-## Step 8 — Get the VM IP address
+## Step 9 — Get the VM IP address
 
 Wait ~30 seconds for the VM to boot and cloud-init to complete, then:
 
@@ -197,15 +247,29 @@ Wait ~30 seconds for the VM to boot and cloud-init to complete, then:
 virsh net-dhcp-leases default
 ```
 
-Or:
-
-```bash
-virsh domifaddr ansible-test-01
-```
+Or check from inside the VM via console (see below).
 
 ---
 
-## Step 9 — Verify SSH access
+## Step 10 — Verify via console (optional)
+
+Connect to the serial console:
+
+```bash
+virsh console ansible-test-01
+```
+
+Login with `ubuntu` / `<your-password>`. Check the network interface:
+
+```bash
+ip addr show
+```
+
+Exit the console with **`Ctrl+]`**.
+
+---
+
+## Step 11 — Verify SSH access
 
 ```bash
 ssh -i ~/.ssh/id_ed25519_homelab ansible@<VM_IP>
@@ -215,7 +279,7 @@ You should get a shell without a password prompt.
 
 ---
 
-## Step 10 — Add the VM to the testing inventory
+## Step 12 — Add the VM to the testing inventory
 
 Edit `inventories/testing/hosts.yml`:
 
@@ -244,6 +308,20 @@ ansible-test-01 | SUCCESS => {
 
 ---
 
+## Rebuilding the VM from scratch
+
+If cloud-init has already run on a disk, it won't run again on reboot. To fully reset:
+
+```bash
+virsh destroy ansible-test-01 && virsh undefine ansible-test-01 && \
+sudo genisoimage -output ~/libvirt/images/ansible-test-01-seed.iso -volid cidata -joliet -rock ~/libvirt/cloud-init/user-data ~/libvirt/cloud-init/meta-data && \
+cp ~/libvirt/images/noble-server-cloudimg-amd64.img ~/libvirt/images/ansible-test-01.img && \
+qemu-img resize ~/libvirt/images/ansible-test-01.img 20G && \
+virt-install --connect qemu:///system --name ansible-test-01 --memory 2048 --vcpus 2 --disk path=$HOME/libvirt/images/ansible-test-01.img,format=qcow2 --disk path=$HOME/libvirt/images/ansible-test-01-seed.iso,device=cdrom --os-variant ubuntu24.04 --network network=default --graphics none --import --noautoconsole
+```
+
+---
+
 ## VM Management Reference
 
 ```bash
@@ -259,7 +337,7 @@ virsh shutdown ansible-test-01
 # Force off
 virsh destroy ansible-test-01
 
-# Open serial console (Ctrl+] to exit)
+# Open serial console (exit with Ctrl+])
 virsh console ansible-test-01
 
 # Delete VM and its disk
@@ -270,22 +348,25 @@ virsh undefine ansible-test-01 --remove-all-storage
 
 ## Troubleshooting
 
+### VM gets no IP address
+Most likely cause: `virbr0` is not in the `libvirt` firewalld zone, so DHCP is blocked.
+Fix: restart the libvirt network (see Step 4).
+
 ### `virsh net-start` fails: "network already in use by virbr0"
-The bridge interface exists but libvirt hasn't claimed it. Skip `net-start` and just run:
-```bash
-sudo virsh net-autostart default
-```
-The network will be fully active after the next `virtnetworkd` restart.
+The bridge interface already exists. Skip `net-start` and run `net-autostart` only.
+The network will be fully managed after the next `virtnetworkd` restart.
 
 ### `virsh` shows network as inactive but `sudo virsh` shows it as active
 Your shell is connecting to `qemu:///session` instead of `qemu:///system`.
 Fix: see Step 3.
 
-### VM has no IP address
-- Confirm the VM is running: `virsh list --all`
-- Check cloud-init completed: `virsh console ansible-test-01`
-- Confirm the seed ISO was attached and `user-data` is valid YAML
+### Console login fails
+The default cloud image `ubuntu` user has no password. Rebuild the VM with a
+`hashed_passwd` in `user-data` (see Step 6).
+
+### `genisoimage` permission denied on the seed ISO
+libvirt took ownership of the file after the VM ran. Use `sudo genisoimage` to overwrite it,
+or destroy the VM first.
 
 ### SSH: permission denied
-- Confirm you're using the right key: `ssh -i ~/.ssh/id_ed25519_homelab ansible@<VM_IP>`
-- Check cloud-init injected the key: connect via console and inspect `~ansible/.ssh/authorized_keys`
+Confirm you are using the right key: `ssh -i ~/.ssh/id_ed25519_homelab ansible@<VM_IP>`
